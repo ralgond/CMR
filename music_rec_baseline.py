@@ -64,8 +64,8 @@ DECADE_MAP: Dict[str, Tuple[int, int]] = {
     "early 70s":  (1970, 1974), "late 70s":   (1975, 1979),
 }
 
-TOP_K_RETRIEVE = 200
-TOP_K_FINAL    = 10
+TOP_K_RETRIEVE = 500   # larger candidate pool improves recall
+TOP_K_FINAL    = 20    # match ndcg@20 evaluation metric
 BM25_WEIGHT    = 0.4
 DENSE_WEIGHT   = 0.6
 
@@ -438,21 +438,34 @@ class FilterEngine:
         m = re.match(r"(\d{4})", str(v))
         return int(m.group(1)) if m else None
 
+    # Minimum fraction of corpus that must survive hard filters.
+    # If a filter would leave fewer tracks than this fraction × total,
+    # that filter is silently relaxed (not applied).
+    MIN_PASS_RATIO = 0.05   # keep at least 5 % of corpus after filtering
+
     def apply(self, intent: ParsedIntent) -> pd.DataFrame:
-        df = self.df
+        df    = self.df
+        total = len(df)
+
+        def _safe_apply(df_in, mask_fn):
+            """Apply mask_fn; fall back to df_in if result is too small."""
+            df_out = df_in[mask_fn(df_in)]
+            if len(df_out) >= max(1, total * self.MIN_PASS_RATIO):
+                return df_out
+            return df_in   # relax – do not apply this filter
 
         if intent.year_min is not None:
-            df = df[df["release_year"].notna() & (df["release_year"] >= intent.year_min)]
+            df = _safe_apply(df, lambda d: d["release_year"].notna() & (d["release_year"] >= intent.year_min))
         if intent.year_max is not None:
-            df = df[df["release_year"].notna() & (df["release_year"] <= intent.year_max)]
+            df = _safe_apply(df, lambda d: d["release_year"].notna() & (d["release_year"] <= intent.year_max))
         if intent.popularity_min is not None:
-            df = df[df["popularity"].notna() & (df["popularity"] >= intent.popularity_min)]
+            df = _safe_apply(df, lambda d: d["popularity"].notna() & (d["popularity"] >= intent.popularity_min))
         if intent.popularity_max is not None:
-            df = df[df["popularity"].notna() & (df["popularity"] <= intent.popularity_max)]
+            df = _safe_apply(df, lambda d: d["popularity"].notna() & (d["popularity"] <= intent.popularity_max))
         if intent.duration_min_ms is not None:
-            df = df[df["duration"].notna() & (df["duration"] >= intent.duration_min_ms)]
+            df = _safe_apply(df, lambda d: d["duration"].notna() & (d["duration"] >= intent.duration_min_ms))
         if intent.duration_max_ms is not None:
-            df = df[df["duration"].notna() & (df["duration"] <= intent.duration_max_ms)]
+            df = _safe_apply(df, lambda d: d["duration"].notna() & (d["duration"] <= intent.duration_max_ms))
 
         return df
 
@@ -529,32 +542,61 @@ class BM25Retriever:
 
 class DenseRetriever:
     """
-    FAISS inner-product search over L2-normalised track attribute embeddings
-    (attributes-qwen3_embedding_0.6b, 1024d).
+    Multi-vector FAISS retrieval.
+
+    Three embedding columns are indexed separately and fused via RRF:
+      - attributes-qwen3_embedding_0.6b  (1024d) – musical attributes / style
+      - metadata-qwen3_embedding_0.6b    (1024d) – artist / album / tags text
+      - lyrics-qwen3_embedding_0.6b      (1024d) – lyrical themes / language
+
+    At query time the same text encoder embeds the semantic_query and scores
+    all three indices; results are merged with equal weights via RRF.
     """
 
-    EMB_COL = "attributes-qwen3_embedding_0.6b"
+    EMB_COLS = [
+        "attributes-qwen3_embedding_0.6b",
+        "metadata-qwen3_embedding_0.6b",
+        "lyrics-qwen3_embedding_0.6b",
+    ]
+    # Weights for RRF fusion of the three indices (attributes gets highest weight
+    # as it captures musical style most directly)
+    EMB_WEIGHTS = [0.5, 0.3, 0.2]
     EMB_DIM = 1024
+
+    # Keep EMB_COL alias so external code that references it still works
+    EMB_COL = "attributes-qwen3_embedding_0.6b"
 
     def __init__(self, track_embeddings: pd.DataFrame):
         import faiss  # type: ignore
 
-        # Drop rows with empty embeddings
-        mask = track_embeddings[self.EMB_COL].apply(
-            lambda x: isinstance(x, (list, np.ndarray)) and len(x) > 0
-        )
-        emb_df = track_embeddings[mask].reset_index(drop=True)
-
-        self._ids: List[str] = emb_df["track_id"].tolist()
+        self._ids: List[str] = track_embeddings["track_id"].tolist()
         self._id2idx: Dict[str, int] = {tid: i for i, tid in enumerate(self._ids)}
 
-        vecs = np.array(emb_df[self.EMB_COL].tolist(), dtype=np.float32)
-        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
-        norms = np.where(norms == 0, 1.0, norms)
-        self._vecs = (vecs / norms).astype(np.float32)
+        self._indexes: List[Any] = []   # one FAISS index per embedding column
+        self._vecs_list: List[np.ndarray] = []
 
-        self._index = faiss.IndexFlatIP(self._vecs.shape[1])
-        self._index.add(self._vecs)
+        for col in self.EMB_COLS:
+            if col not in track_embeddings.columns:
+                # Column absent → store None, skip this index
+                self._indexes.append(None)
+                self._vecs_list.append(None)
+                continue
+
+            # Build a float32 matrix; rows with empty/missing embeddings → zeros
+            def _to_vec(v):
+                if isinstance(v, (list, np.ndarray)) and len(v) > 0:
+                    return np.asarray(v, dtype=np.float32)
+                return np.zeros(self.EMB_DIM, dtype=np.float32)
+
+            vecs = np.vstack([_to_vec(v) for v in track_embeddings[col]])
+            norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+            norms = np.where(norms == 0, 1.0, norms)
+            vecs = (vecs / norms).astype(np.float32)
+
+            idx = faiss.IndexFlatIP(vecs.shape[1])
+            idx.add(vecs)
+            self._indexes.append(idx)
+            self._vecs_list.append(vecs)
 
         self._encoder = None   # lazy init
 
@@ -589,10 +631,21 @@ class DenseRetriever:
                 self._encoder = _HashEncoder()
         return self._encoder
 
+    # Qwen3-Embedding requires an instruction prefix for query encoding.
+    # Documents (track embeddings) are stored WITHOUT prefix – so only the
+    # query side needs it.  See: https://huggingface.co/Qwen/Qwen3-Embedding
+    QUERY_INSTRUCTION = (
+        "Instruct: Given a user music request, retrieve the most relevant tracks\n"
+        "Query: "
+    )
+
     def _encode(self, text: str) -> np.ndarray:
         enc = self._get_encoder()
-        v = enc.encode([text], normalize_embeddings=True)[0].astype(np.float32)
-        # Pad / truncate to EMB_DIM
+        # Prepend instruction prefix so query lives in the same embedding space
+        # as the pre-computed track embeddings (which were encoded as documents).
+        prompted = self.QUERY_INSTRUCTION + text
+        v = enc.encode([prompted], normalize_embeddings=True)[0].astype(np.float32)
+        # Pad / truncate to EMB_DIM (handles any encoder output dim mismatch)
         if v.shape[0] < self.EMB_DIM:
             v = np.pad(v, (0, self.EMB_DIM - v.shape[0]))
         else:
@@ -602,25 +655,55 @@ class DenseRetriever:
 
     # ── Retrieval ────────────────────────────────────────────────────────────
 
-    def _score_candidates(
-        self, qv: np.ndarray, candidate_ids: Optional[List[str]], top_k: int
+    def _score_single_index(
+        self,
+        idx_pos: int,
+        qv: np.ndarray,
+        candidate_ids: Optional[List[str]],
+        top_k: int,
     ) -> Dict[str, float]:
+        """Score one FAISS index; returns {track_id: cosine_sim}."""
+        faiss_idx = self._indexes[idx_pos]
+        vecs      = self._vecs_list[idx_pos]
+        if faiss_idx is None or vecs is None:
+            return {}
+
         qv = qv.reshape(1, -1)
         if candidate_ids is None:
-            scores, idxs = self._index.search(qv, top_k)
+            scores, idxs = faiss_idx.search(qv, top_k)
             return {
                 self._ids[i]: float(s)
                 for s, i in zip(scores[0], idxs[0])
                 if i >= 0
             }
         results = {
-            tid: float(np.dot(qv[0], self._vecs[self._id2idx[tid]]))
+            tid: float(np.dot(qv[0], vecs[self._id2idx[tid]]))
             for tid in candidate_ids
             if tid in self._id2idx
         }
-        return dict(
-            sorted(results.items(), key=lambda x: x[1], reverse=True)[:top_k]
-        )
+        return dict(sorted(results.items(), key=lambda x: x[1], reverse=True)[:top_k])
+
+    def _score_candidates(
+        self, qv: np.ndarray, candidate_ids: Optional[List[str]], top_k: int
+    ) -> Dict[str, float]:
+        """Fuse all available embedding indices with RRF."""
+        ranked_lists = []
+        weights = []
+        for i, w in enumerate(self.EMB_WEIGHTS):
+            scores = self._score_single_index(i, qv, candidate_ids, top_k)
+            if scores:
+                ranked_lists.append(scores)
+                weights.append(w)
+        if not ranked_lists:
+            return {}
+        # Inline RRF (avoid circular import with module-level rrf_fusion)
+        fused: Dict[str, float] = {}
+        for rl, w in zip(ranked_lists, weights):
+            for rank, (doc_id, _) in enumerate(
+                sorted(rl.items(), key=lambda x: x[1], reverse=True), start=1
+            ):
+                fused[doc_id] = fused.get(doc_id, 0.0) + w / (60 + rank)
+        return dict(sorted(fused.items(), key=lambda x: x[1], reverse=True)[:top_k])
 
     def retrieve(
         self,
@@ -640,11 +723,16 @@ class DenseRetriever:
         candidate_ids: Optional[List[str]] = None,
         top_k: int = TOP_K_RETRIEVE,
     ) -> Dict[str, float]:
+        # Use the attributes index (index 0) for example-based retrieval
+        vecs_mat = self._vecs_list[0]
+        if vecs_mat is None:
+            return {}
+
         def centroid(ids):
-            vecs = [self._vecs[self._id2idx[i]] for i in ids if i in self._id2idx]
-            if not vecs:
+            vs = [vecs_mat[self._id2idx[i]] for i in ids if i in self._id2idx]
+            if not vs:
                 return None
-            c = np.mean(vecs, axis=0).astype(np.float32)
+            c = np.mean(vs, axis=0).astype(np.float32)
             c /= np.linalg.norm(c) + 1e-9
             return c
 
@@ -718,18 +806,38 @@ class CFBPRRanker:
         user_v  = self._user_cf.get(user_id)
         max_rrf = max(rrf_scores.values()) or 1.0
 
+        # Compute raw CF scores first so we can normalise them
+        raw_cf: Dict[str, float] = {}
+        if user_v is not None:
+            for tid in rrf_scores:
+                if tid in self._track_cf:
+                    raw_cf[tid] = float(np.dot(user_v, self._track_cf[tid]))
+
+        # Normalise CF scores to [0, 1] using min-max over the candidate set.
+        # This prevents CF magnitude from dominating RRF on warm users or being
+        # meaningless on cold users.
+        if raw_cf:
+            cf_min = min(raw_cf.values())
+            cf_max = max(raw_cf.values())
+            cf_range = cf_max - cf_min or 1.0
+            norm_cf = {tid: (s - cf_min) / cf_range for tid, s in raw_cf.items()}
+        else:
+            norm_cf = {}
+
+        # Cold user (not in embedding table) → use retrieval score only
+        effective_alpha = 1.0 if not norm_cf else self.alpha
+        effective_beta  = 0.0 if not norm_cf else self.beta
+
         results: List[ScoredTrack] = []
         for tid, rrf_s in rrf_scores.items():
             norm_rrf = rrf_s / max_rrf
-            cf_s = 0.0
-            if user_v is not None and tid in self._track_cf:
-                cf_s = float(np.dot(user_v, self._track_cf[tid]))
+            cf_s     = norm_cf.get(tid, 0.0)
             results.append(
                 ScoredTrack(
                     track_id=tid,
                     rrf_score=rrf_s,
                     cf_score=cf_s,
-                    final_score=self.alpha * norm_rrf + self.beta * cf_s,
+                    final_score=effective_alpha * norm_rrf + effective_beta * cf_s,
                 )
             )
 
@@ -847,7 +955,17 @@ class MusicRecPipeline:
                   f"(bm25:{bw:.1f} dense:{dw:.1f})")
 
         # 6. CF-BPR rerank
-        ranked = self.ranker.rank(user_id, rrf_scores, top_k=top_k)
+        # Request extra candidates so we still have top_k after excluding played
+        n_played = len(intent.positive_track_ids)
+        ranked = self.ranker.rank(user_id, rrf_scores,
+                                   top_k=top_k + n_played + 5)
+
+        # Remove already-played tracks from the recommendation list
+        if intent.positive_track_ids:
+            played_set = set(intent.positive_track_ids)
+            ranked = [st for st in ranked if st.track_id not in played_set]
+        ranked = ranked[:top_k]
+
         if verbose:
             print(f"[6] Rerank  top-{len(ranked)}  "
                   f"({time.time()-t0:.2f}s total)\n")
@@ -1028,13 +1146,13 @@ def _demo_synthetic():
 # ─────────────────────────────────────────────────────────────────────────────
 
 RESPONSE_SYSTEM_PROMPT = """
-You are a music recommendation assistant.
-Given a conversation history and a list of recommended track titles/artists,
-write a SHORT, natural, friendly response (2-3 sentences) that:
-1. Directly addresses what the user asked for.
-2. Briefly explains WHY these tracks were chosen (mood, genre, era, style).
-3. Does NOT list the tracks again – just describe them as a group.
-Keep it under 60 words.
+You are a music recommendation assistant having a natural conversation.
+Given a conversation history and recommended tracks, write a response that:
+1. Directly and warmly addresses what the user asked for.
+2. Mentions 2-3 specific track or artist names from the list to feel concrete.
+3. Explains WHY these fit (mood, genre, era, energy, lyrical theme).
+4. Invites further refinement if needed ("Let me know if you want more like X").
+Keep it conversational, 3-5 sentences, under 100 words. No bullet points.
 """
 
 
@@ -1045,26 +1163,34 @@ def _generate_response(
 ) -> str:
     """
     Ask DeepSeek to produce a natural-language response for the recommendation.
-    Falls back to a template string if the API is unavailable.
+    Falls back to a richer template string if the API is unavailable.
     """
-    # Build a short track summary for the prompt
-    track_summaries = []
-    for st in ranked[:5]:        # only describe the top-5 to keep prompt short
-        m = st.metadata
-        name   = m.get("track_name", st.track_id)
+    # Build track list with year and tags for richer context (up to 8 tracks)
+    track_lines = []
+    for st in ranked[:8]:
+        m      = st.metadata
+        name   = m.get("track_name", "?")
         artist = m.get("artist_name", "")
-        track_summaries.append(f"{name} by {artist}" if artist else name)
-    tracks_str = "; ".join(track_summaries) if track_summaries else "various tracks"
+        year   = m.get("release_date", "")[:4]
+        tags   = ", ".join(m.get("tags", [])[:3])
+        line   = f"- {name} by {artist}" + (f" ({year})" if year else "")
+        if tags:
+            line += f"  [{tags}]"
+        track_lines.append(line)
+    tracks_block = "\n".join(track_lines) if track_lines else "- (no tracks)"
 
-    # Last user message as context
-    last_user = next(
-        (m["content"] for m in reversed(conversation) if m["role"] == "user"), ""
+    # Full conversation context (last 6 turns) so the model understands the dialogue
+    conv_text = "\n".join(
+        f"{m['role'].capitalize()}: {m['content']}"
+        for m in conversation[-6:]
+        if m.get("content", "").strip()
+        and not m["content"].startswith("[Previously played")
     )
 
     prompt = (
-        f"User request: \"{last_user}\"\n"
-        f"Top recommended tracks: {tracks_str}\n"
-        "Write a recommendation response."
+        f"Conversation so far:\n{conv_text}\n\n"
+        f"Recommended tracks:\n{tracks_block}\n\n"
+        "Write a natural recommendation response to continue this conversation."
     )
 
     try:
@@ -1081,40 +1207,59 @@ def _generate_response(
                     {"role": "system", "content": RESPONSE_SYSTEM_PROMPT},
                     {"role": "user",   "content": prompt},
                 ],
-                "max_tokens": 120,
-                "temperature": 0.7,
+                "max_tokens": 180,
+                "temperature": 0.6,
             },
-            timeout=15,
+            timeout=20,
         )
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        # Graceful fallback
-        genre_hint = ""
-        if ranked and ranked[0].metadata.get("tags"):
-            genre_hint = f" ({', '.join(ranked[0].metadata['tags'][:2])})"
+        # Richer fallback using actual track metadata
+        if ranked:
+            m0     = ranked[0].metadata
+            name0  = m0.get("track_name", "these tracks")
+            artist0= m0.get("artist_name", "")
+            tags0  = m0.get("tags", [])
+            style  = ", ".join(tags0[:2]) if tags0 else "this style"
+            opener = f"I've picked {name0}" + (f" by {artist0}" if artist0 else "")
+        else:
+            opener = "I've curated a selection"
+            style  = "your taste"
         return (
-            f"Here are some tracks that match your request{genre_hint}. "
-            f"I picked these based on your musical taste and what you described. "
-            f"Hope you enjoy them!"
+            f"{opener} and similar tracks that match the {style} vibe you're after. "
+            f"These should capture exactly what you described — "
+            f"let me know if you'd like me to adjust the mood or explore a different direction!"
         )
 
 
 def _build_conversation_history(turns: List[Dict]) -> List[Dict[str, str]]:
     """
-    Convert blind-A conversation turns (which include role/content/thought/turn_number)
-    into the simple {role, content} format expected by the pipeline.
-    Skips 'music' turns (those contain track_ids, not natural language).
+    Convert blind-A conversation turns into {role, content} dicts.
+
+    Role mapping:
+      user      → user
+      assistant → assistant  (natural-language replies)
+      music     → skipped for intent parsing (track_id, not text);
+                  BUT the associated 'thought' field (assistant reasoning)
+                  is included as an assistant turn when present, because it
+                  carries useful context about why a track was chosen.
     """
     history = []
     for t in turns:
         role    = t.get("role", "")
-        content = t.get("content", "") or ""
-        if role == "user":
+        content = (t.get("content", "") or "").strip()
+        thought = (t.get("thought", "") or "").strip()
+
+        if role == "user" and content:
             history.append({"role": "user", "content": content})
-        elif role in ("assistant", "system") and content:
+        elif role == "assistant" and content:
             history.append({"role": "assistant", "content": content})
-        # 'music' role turns contain a track_id string – skip for intent parsing
+        elif role == "music":
+            # Include the assistant's thought (recommendation rationale) if present
+            if thought:
+                history.append({"role": "assistant", "content": thought})
+        # system turns: skip
     return history
 
 
