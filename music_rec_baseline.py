@@ -169,6 +169,18 @@ class ParsedIntent:
     positive_track_ids: List[str]   = field(default_factory=list)
     negative_track_ids: List[str]   = field(default_factory=list)
 
+    # Extra context injected from session metadata (not from DeepSeek)
+    listener_goal:      str         = ""   # conversation_goal.listener_goal
+    user_culture:       str         = ""   # user_profile.preferred_musical_culture
+
+    # Retrieval mode – set by classify_retrieval_mode() after intent parsing
+    # "exact_track"  : user names a specific song title
+    # "exact_artist" : user names a specific artist (all tracks by that artist)
+    # "exact_album"  : user names a specific album
+    # "genre_mood"   : genre / mood / era search (no specific entity)
+    # "abstract"     : purely vibe-based, no text anchors
+    retrieval_mode: str             = ""
+
 
 @dataclass
 class ScoredTrack:
@@ -180,6 +192,219 @@ class ScoredTrack:
     final_score: float = 0.0
     metadata:    Dict[str, Any] = field(default_factory=dict)
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2b. Session Index  (built from training conversations)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2b. UserHistoryIndex  (the RIGHT way to use training sessions)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class UserHistoryIndex:
+    """
+    Builds a per-user profile from training sessions:
+
+      user_id → {
+        accepted_track_ids: [...]   # MOVES_TOWARD_GOAL tracks (ordered)
+        rejected_track_ids: [...]   # DOES_NOT_MOVE tracks
+        accepted_artists:   Counter # artist_name → accept count
+        accepted_tags:      Counter # tag → accept count
+      }
+
+    At predict time, for warm users:
+      1. The accepted_track_ids seed example-based dense retrieval directly
+         (instead of relying on DeepSeek to parse UUIDs from conversation)
+      2. The top accepted artists/tags are injected into BM25 query expansion
+      3. Rejected tracks are excluded from the final result
+
+    For cold users: no history → falls back to normal pipeline.
+
+    Why this works for ndcg@20=0.5:
+      A user who historically listened to "Nine Inch Nails" and "Rammstein"
+      will get industrial metal tracks ranked #1-2, which is exactly right.
+      The training data directly tells us the user's taste.
+    """
+
+    UUID_RE = re.compile(
+        r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        re.I,
+    )
+
+    def __init__(
+        self,
+        sessions_df: pd.DataFrame,
+        track_meta: pd.DataFrame,
+    ):
+        from collections import Counter, defaultdict
+
+        def _to_list(v):
+            if v is None: return []
+            if isinstance(v, np.ndarray): return v.tolist()
+            if isinstance(v, list): return v
+            try:
+                import pandas as _pd
+                if _pd.isna(v): return []
+            except (TypeError, ValueError): pass
+            return []
+
+        def _to_dict(v):
+            if v is None or (isinstance(v, float) and np.isnan(v)): return {}
+            if isinstance(v, dict): return v
+            if isinstance(v, str):
+                try: return json.loads(v)
+                except: return {}
+            return {}
+
+        def _safe_join(v):
+            if isinstance(v, (list, np.ndarray)):
+                return " ".join(str(x) for x in v if x)
+            return str(v) if v else ""
+
+        # Build track_id → {artist_names, tags} lookup from track_meta
+        self._track_artists: Dict[str, List[str]] = {}
+        self._track_tags:    Dict[str, List[str]] = {}
+        for _, row in track_meta.iterrows():
+            tid = str(row.get("track_id", "") or "")
+            if not tid: continue
+            artists = _to_list(row.get("artist_name"))
+            tags    = _to_list(row.get("tag_list"))
+            self._track_artists[tid] = [str(a) for a in artists if a]
+            self._track_tags[tid]    = [str(t) for t in tags if t]
+
+        # user_id → profile
+        self._profiles: Dict[str, Dict] = defaultdict(lambda: {
+            "accepted_track_ids": [],
+            "rejected_track_ids": [],
+            "accepted_artists":   Counter(),
+            "accepted_tags":      Counter(),
+        })
+
+        n_users = 0
+        n_accepted = 0
+
+        for _, row in sessions_df.iterrows():
+            user_id     = str(row.get("user_id", "") or "")
+            turns       = _to_list(row.get("conversations"))
+            assessments = _to_list(row.get("goal_progress_assessments"))
+            if not user_id: continue
+
+            # build turn_number → assessment
+            assess_map: Dict[int, str] = {}
+            for a in assessments:
+                a = _to_dict(a) if not isinstance(a, dict) else a
+                tn  = a.get("turn_number")
+                gpa = str(a.get("goal_progress_assessment") or "")
+                if tn is not None:
+                    try: assess_map[int(tn)] = gpa
+                    except (TypeError, ValueError): pass
+
+            profile = self._profiles[user_id]
+            is_new  = len(profile["accepted_track_ids"]) == 0
+
+            for t in turns:
+                t = _to_dict(t) if not isinstance(t, dict) else t
+                role    = str(t.get("role", "") or "")
+                content = str(t.get("content", "") or "").strip()
+                turn_no = t.get("turn_number")
+                if role != "music" or not self.UUID_RE.match(content):
+                    continue
+                gpa = assess_map.get(int(turn_no) if turn_no is not None else -1, "")
+                if gpa == "MOVES_TOWARD_GOAL":
+                    profile["accepted_track_ids"].append(content)
+                    # accumulate artist/tag counts
+                    for a in self._track_artists.get(content, []):
+                        profile["accepted_artists"][a] += 1
+                    for tg in self._track_tags.get(content, [])[:5]:
+                        profile["accepted_tags"][tg] += 1
+                    n_accepted += 1
+                elif gpa == "DOES_NOT_MOVE_TOWARD_GOAL":
+                    profile["rejected_track_ids"].append(content)
+
+            if is_new and len(profile["accepted_track_ids"]) > 0:
+                n_users += 1
+
+        # Deduplicate (preserve order, keep most recent)
+        for uid, p in self._profiles.items():
+            seen: set = set()
+            deduped = []
+            for t in p["accepted_track_ids"]:
+                if t not in seen:
+                    seen.add(t)
+                    deduped.append(t)
+            p["accepted_track_ids"] = deduped
+
+            seen2: set = set()
+            deduped2 = []
+            for t in p["rejected_track_ids"]:
+                if t not in seen2:
+                    seen2.add(t)
+                    deduped2.append(t)
+            p["rejected_track_ids"] = deduped2
+
+        print(f"[UserHistoryIndex] {n_users} users with history  "
+              f"{n_accepted} accepted interactions")
+
+    def has_history(self, user_id: str) -> bool:
+        return len(self._profiles.get(user_id, {}).get("accepted_track_ids", [])) > 0
+
+    def get_accepted_tracks(self, user_id: str, max_recent: int = 10) -> List[str]:
+        """Most recent accepted track_ids (best seed for dense retrieval)."""
+        tracks = self._profiles.get(user_id, {}).get("accepted_track_ids", [])
+        return tracks[-max_recent:]
+
+    def get_rejected_tracks(self, user_id: str) -> set:
+        return set(self._profiles.get(user_id, {}).get("rejected_track_ids", []))
+
+    def get_top_artists(self, user_id: str, top_n: int = 5) -> List[str]:
+        """Top accepted artists by frequency → BM25 query expansion."""
+        counter = self._profiles.get(user_id, {}).get("accepted_artists", {})
+        return [a for a, _ in sorted(counter.items(), key=lambda x: x[1], reverse=True)[:top_n]]
+
+    def get_top_tags(self, user_id: str, top_n: int = 8) -> List[str]:
+        """Top accepted tags by frequency → BM25 query expansion."""
+        counter = self._profiles.get(user_id, {}).get("accepted_tags", {})
+        return [t for t, _ in sorted(counter.items(), key=lambda x: x[1], reverse=True)[:top_n]]
+
+    def enrich_intent(self, user_id: str, intent: "ParsedIntent") -> "ParsedIntent":
+        """
+        Inject user history signals into the intent object:
+          - accepted_track_ids → positive_track_ids (seeds dense retrieval)
+          - top artists → artist_names if not already set
+          - top tags → genres/mood
+          - rejected tracks → negative_track_ids
+        Current session's positive_track_ids take priority (appended last).
+        """
+        if not self.has_history(user_id):
+            return intent
+
+        hist_tracks = self.get_accepted_tracks(user_id, max_recent=10)
+        # Merge: history first, current session last (more recent = higher weight)
+        combined = list(dict.fromkeys(hist_tracks + intent.positive_track_ids))
+        intent.positive_track_ids = combined
+
+        # Enrich negative tracks
+        rejected = self.get_rejected_tracks(user_id)
+        intent.negative_track_ids = list(
+            set(intent.negative_track_ids) | rejected
+        )
+
+        # Only inject history artist/tag when the query is abstract or vague
+        # (don't override when user has specified a concrete entity)
+        mode = intent.retrieval_mode or BM25Retriever._classify_mode(intent)
+        if mode in ("abstract", "genre_mood", "default") and not intent.artist_names:
+            top_artists = self.get_top_artists(user_id, top_n=3)
+            if top_artists:
+                intent.artist_names = top_artists
+
+        if mode in ("abstract", "genre_mood") and not intent.genres and not intent.mood:
+            top_tags = self.get_top_tags(user_id, top_n=5)
+            if top_tags:
+                intent.genres = top_tags
+
+        return intent
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. Intent Cache
@@ -475,41 +700,99 @@ class FilterEngine:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class BM25Retriever:
-    """BM25Okapi over concatenated text fields + decade tokens."""
+    """
+    Stratified BM25 retrieval.
+
+    Uses retrieval_mode to decide WHICH fields to match and HOW:
+
+      exact_track  → query on track_name only; strong signal
+      exact_artist → query on artist_name only; pre-filter by artist match
+      exact_album  → query on album_name only; pre-filter by album match
+      genre_mood   → query on tag_list + decade; no title/artist noise
+      abstract     → query on tag_list + mood; pure vibe matching
+      (default)    → full query, all fields combined (current behaviour)
+
+    BM25 scores are normalised per retrieval mode so downstream RRF
+    weights remain consistent.
+    """
 
     def __init__(self, track_meta: pd.DataFrame):
         from rank_bm25 import BM25Okapi  # type: ignore
 
-        self._ids = track_meta["track_id"].tolist()
-        corpus = [self._doc(row) for _, row in track_meta.iterrows()]
-        self._bm25 = BM25Okapi([d.lower().split() for d in corpus])
+        self._ids    = track_meta["track_id"].tolist()
+        self._id2idx = {tid: i for i, tid in enumerate(self._ids)}
+
+        # Store raw field values for per-field lookup
+        self._artist_names: List[str] = []
+        self._album_names:  List[str] = []
+        self._track_names:  List[str] = []
+        self._tag_strings:  List[str] = []
+        self._year_strings: List[str] = []
+
+        for _, row in track_meta.iterrows():
+            self._artist_names.append(self._safe_join(row.get("artist_name")).lower())
+            self._album_names.append(self._safe_join(row.get("album_name")).lower())
+            self._track_names.append(self._safe_join(row.get("track_name")).lower())
+            self._tag_strings.append(self._safe_join(row.get("tag_list")).lower())
+            rd = str(row.get("release_date") or "")
+            m = re.match(r"(\d{4})", rd)
+            if m:
+                yr = int(m.group(1))
+                self._year_strings.append(f"{(yr//10)*10}s {yr}")
+            else:
+                self._year_strings.append("")
+
+        # Four separate BM25 indexes for different match strategies
+        def _mk(docs):
+            return BM25Okapi([d.split() for d in docs])
+
+        # Full-text: all fields combined (fallback)
+        full_corpus = [
+            " ".join(filter(None, [an, aln, tn, tg, yr]))
+            for an, aln, tn, tg, yr in zip(
+                self._artist_names, self._album_names,
+                self._track_names, self._tag_strings, self._year_strings
+            )
+        ]
+        self._bm25_full   = _mk(full_corpus)
+        self._corpus      = full_corpus   # kept for legacy
+
+        # Artist-only index
+        self._bm25_artist = _mk(self._artist_names)
+
+        # Album-only index
+        self._bm25_album  = _mk(self._album_names)
+
+        # Track-name-only index
+        self._bm25_track  = _mk(self._track_names)
+
+        # Tag + year index (genre/mood/era)
+        tag_year_corpus = [
+            " ".join(filter(None, [tg, yr]))
+            for tg, yr in zip(self._tag_strings, self._year_strings)
+        ]
+        self._bm25_tag    = _mk(tag_year_corpus)
 
     @staticmethod
     def _safe_join(v: Any) -> str:
-        # parquet list columns may come back as list, np.ndarray, or other iterables
         if v is None:
             return ""
         if isinstance(v, (list, np.ndarray)):
             return " ".join(str(x) for x in v if x is not None and str(x).strip())
-        # scalar (e.g. a plain string that wasn't stored as a list)
         s = str(v).strip()
         return s if s not in ("nan", "None", "") else ""
 
-    def _doc(self, row: pd.Series) -> str:
-        parts = [
-            self._safe_join(row.get("track_name")),
-            self._safe_join(row.get("artist_name")),
-            self._safe_join(row.get("album_name")),
-            self._safe_join(row.get("tag_list")),
-        ]
-        # Embed decade + individual years so "2000s" matches
-        rd = str(row.get("release_date") or "")
-        m = re.match(r"(\d{4})", rd)
-        if m:
-            yr = int(m.group(1))
-            decade = (yr // 10) * 10
-            parts.append(f"{decade}s {yr}")
-        return " ".join(filter(None, parts))
+    def _scores_to_dict(
+        self,
+        scores: np.ndarray,
+        candidate_ids: Optional[List[str]],
+        top_k: int,
+    ) -> Dict[str, float]:
+        id_score = dict(zip(self._ids, map(float, scores)))
+        if candidate_ids is not None:
+            cset = set(candidate_ids)
+            id_score = {k: v for k, v in id_score.items() if k in cset}
+        return dict(sorted(id_score.items(), key=lambda x: x[1], reverse=True)[:top_k])
 
     def retrieve(
         self,
@@ -517,23 +800,119 @@ class BM25Retriever:
         candidate_ids: Optional[List[str]] = None,
         top_k: int = TOP_K_RETRIEVE,
     ) -> Dict[str, float]:
+        mode = intent.retrieval_mode or self._classify_mode(intent)
+
+        # ── exact_track: user named a specific song title ─────────────────────
+        if mode == "exact_track" and intent.track_names:
+            query = " ".join(intent.track_names).lower().split()
+            # Also narrow by artist if given
+            if intent.artist_names:
+                artist_q = " ".join(intent.artist_names).lower()
+                cids_artist = [
+                    tid for tid, a in zip(self._ids, self._artist_names)
+                    if any(name.lower() in a for name in intent.artist_names)
+                ]
+                cids_use = list(set(cids_artist) & set(candidate_ids)) if candidate_ids else cids_artist
+                candidate_ids = cids_use or candidate_ids
+            scores = self._bm25_track.get_scores(query)
+            return self._scores_to_dict(scores, candidate_ids, top_k)
+
+        # ── exact_artist: user named a specific artist ────────────────────────
+        if mode == "exact_artist" and intent.artist_names:
+            # Pre-filter: only tracks whose artist_name contains any named artist
+            artist_lower = [a.lower() for a in intent.artist_names]
+            artist_cids = [
+                tid for tid, a in zip(self._ids, self._artist_names)
+                if any(al in a for al in artist_lower)
+            ]
+            if candidate_ids:
+                artist_cids = [t for t in artist_cids if t in set(candidate_ids)]
+            if not artist_cids:
+                # Fall back to BM25 artist search
+                query = " ".join(intent.artist_names).lower().split()
+                scores = self._bm25_artist.get_scores(query)
+                return self._scores_to_dict(scores, candidate_ids, top_k)
+            # Within artist tracks, rank by tag/mood/year match if any
+            if intent.genres or intent.mood or intent.decade:
+                tag_query = (
+                    " ".join(intent.genres + intent.mood)
+                    + " " + (intent.decade or "")
+                ).strip().lower().split()
+                if tag_query:
+                    scores = self._bm25_tag.get_scores(tag_query)
+                    return self._scores_to_dict(scores, artist_cids, top_k)
+            # No further refinement: return all tracks by artist, scored equally
+            # (BM25 artist name match gives natural ranking)
+            query = " ".join(intent.artist_names).lower().split()
+            scores = self._bm25_artist.get_scores(query)
+            return self._scores_to_dict(scores, artist_cids, top_k)
+
+        # ── exact_album: user named a specific album ──────────────────────────
+        if mode == "exact_album" and intent.album_names:
+            album_lower = [a.lower() for a in intent.album_names]
+            album_cids = [
+                tid for tid, a in zip(self._ids, self._album_names)
+                if any(al in a for al in album_lower)
+            ]
+            if candidate_ids:
+                album_cids = [t for t in album_cids if t in set(candidate_ids)]
+            if album_cids:
+                # All tracks from the album; no further ranking needed
+                return {tid: 1.0 for tid in album_cids[:top_k]}
+            # Fall back to BM25 album search
+            query = " ".join(intent.album_names).lower().split()
+            scores = self._bm25_album.get_scores(query)
+            return self._scores_to_dict(scores, candidate_ids, top_k)
+
+        # ── genre_mood / abstract: tag + year + mood matching ─────────────────
+        if mode in ("genre_mood", "abstract"):
+            tag_tokens = (
+                intent.genres + intent.mood + intent.themes
+            )
+            if intent.decade:
+                tag_tokens += intent.decade.lower().split()
+            if intent.user_culture:
+                tag_tokens += intent.user_culture.lower().split()
+            if intent.listener_goal:
+                # Only add content words from listener_goal, not stop words
+                stop = {"a","the","and","or","in","of","to","for","with","that","this","is","it","from"}
+                tag_tokens += [w for w in intent.listener_goal.lower().split() if w not in stop]
+            if not tag_tokens:
+                return {}
+            scores = self._bm25_tag.get_scores([t.lower() for t in tag_tokens])
+            return self._scores_to_dict(scores, candidate_ids, top_k)
+
+        # ── default: full-text query (all fields) ─────────────────────────────
         tokens = (
             intent.artist_names + intent.track_names + intent.album_names
             + intent.genres + intent.mood + intent.themes
         )
         if intent.semantic_query:
             tokens += intent.semantic_query.split()
+        if intent.listener_goal:
+            stop = {"a","the","and","or","in","of","to","for","with","that","this","is","it","from"}
+            tokens += [w for w in intent.listener_goal.lower().split() if w not in stop]
+        if intent.user_culture:
+            tokens += intent.user_culture.lower().split()
         if not tokens:
             return {}
+        scores = self._bm25_full.get_scores([t.lower() for t in tokens])
+        return self._scores_to_dict(scores, candidate_ids, top_k)
 
-        scores = self._bm25.get_scores([t.lower() for t in tokens])
-        id_score = dict(zip(self._ids, map(float, scores)))
-
-        if candidate_ids is not None:
-            cset = set(candidate_ids)
-            id_score = {k: v for k, v in id_score.items() if k in cset}
-
-        return dict(sorted(id_score.items(), key=lambda x: x[1], reverse=True)[:top_k])
+    @staticmethod
+    def _classify_mode(intent: "ParsedIntent") -> str:
+        """Infer retrieval mode from intent fields when not explicitly set."""
+        if intent.track_names:
+            return "exact_track"
+        if intent.album_names and not intent.artist_names:
+            return "exact_album"
+        if intent.artist_names and not intent.track_names:
+            return "exact_artist"
+        if intent.genres or intent.mood:
+            return "genre_mood"
+        if intent.is_abstract:
+            return "abstract"
+        return "default"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -554,14 +933,16 @@ class DenseRetriever:
     """
 
     EMB_COLS = [
-        "attributes-qwen3_embedding_0.6b",
-        "metadata-qwen3_embedding_0.6b",
-        "lyrics-qwen3_embedding_0.6b",
+        "attributes-qwen3_embedding_0.6b",   # 1024d – musical style/mood
+        "metadata-qwen3_embedding_0.6b",      # 1024d – artist/album/tag text
+        "lyrics-qwen3_embedding_0.6b",        # 1024d – lyrical themes
+        "audio-laion_clap",                   # 512d  – acoustic audio features
     ]
-    # Weights for RRF fusion of the three indices (attributes gets highest weight
-    # as it captures musical style most directly)
-    EMB_WEIGHTS = [0.5, 0.3, 0.2]
-    EMB_DIM = 1024
+    # Weights for RRF fusion across indices.
+    # audio-laion_clap gets a strong weight because it captures acoustic
+    # similarity (tempo, timbre, energy) that text embeddings miss entirely.
+    EMB_WEIGHTS = [0.35, 0.20, 0.15, 0.30]
+    EMB_DIM = 1024   # default; audio-laion_clap uses 512 (handled per-index)
 
     # Keep EMB_COL alias so external code that references it still works
     EMB_COL = "attributes-qwen3_embedding_0.6b"
@@ -582,11 +963,17 @@ class DenseRetriever:
                 self._vecs_list.append(None)
                 continue
 
-            # Build a float32 matrix; rows with empty/missing embeddings → zeros
-            def _to_vec(v):
+            # Infer actual dimension from first non-empty row
+            actual_dim = self.EMB_DIM
+            for v in track_embeddings[col]:
+                if isinstance(v, (list, np.ndarray)) and len(v) > 0:
+                    actual_dim = len(v)
+                    break
+
+            def _to_vec(v, dim=actual_dim):
                 if isinstance(v, (list, np.ndarray)) and len(v) > 0:
                     return np.asarray(v, dtype=np.float32)
-                return np.zeros(self.EMB_DIM, dtype=np.float32)
+                return np.zeros(dim, dtype=np.float32)
 
             vecs = np.vstack([_to_vec(v) for v in track_embeddings[col]])
             norms = np.linalg.norm(vecs, axis=1, keepdims=True)
@@ -639,17 +1026,15 @@ class DenseRetriever:
         "Query: "
     )
 
-    def _encode(self, text: str) -> np.ndarray:
+    def _encode(self, text: str, target_dim: int = None) -> np.ndarray:
         enc = self._get_encoder()
-        # Prepend instruction prefix so query lives in the same embedding space
-        # as the pre-computed track embeddings (which were encoded as documents).
         prompted = self.QUERY_INSTRUCTION + text
         v = enc.encode([prompted], normalize_embeddings=True)[0].astype(np.float32)
-        # Pad / truncate to EMB_DIM (handles any encoder output dim mismatch)
-        if v.shape[0] < self.EMB_DIM:
-            v = np.pad(v, (0, self.EMB_DIM - v.shape[0]))
+        dim = target_dim or self.EMB_DIM
+        if v.shape[0] < dim:
+            v = np.pad(v, (0, dim - v.shape[0]))
         else:
-            v = v[: self.EMB_DIM]
+            v = v[:dim]
         v /= np.linalg.norm(v) + 1e-9
         return v
 
@@ -667,6 +1052,16 @@ class DenseRetriever:
         vecs      = self._vecs_list[idx_pos]
         if faiss_idx is None or vecs is None:
             return {}
+
+        # Re-encode query at the correct dimension if it doesn't match the index
+        index_dim = vecs.shape[1]
+        if qv.shape[0] != index_dim:
+            # The query was encoded at a different dimension – re-slice or re-encode
+            if qv.shape[0] > index_dim:
+                qv = qv[:index_dim]
+            else:
+                qv = np.pad(qv, (0, index_dim - qv.shape[0]))
+            qv /= np.linalg.norm(qv) + 1e-9
 
         qv = qv.reshape(1, -1)
         if candidate_ids is None:
@@ -723,26 +1118,49 @@ class DenseRetriever:
         candidate_ids: Optional[List[str]] = None,
         top_k: int = TOP_K_RETRIEVE,
     ) -> Dict[str, float]:
-        # Use the attributes index (index 0) for example-based retrieval
-        vecs_mat = self._vecs_list[0]
-        if vecs_mat is None:
+        """
+        Score each available index independently using the centroid of played
+        tracks, then fuse with RRF. This is better than using only index 0
+        because different indices capture different aspects (style, lyrics, audio).
+        """
+        all_scores: List[Dict[str, float]] = []
+        all_weights: List[float] = []
+
+        for i, (vecs_mat, w) in enumerate(zip(self._vecs_list, self.EMB_WEIGHTS)):
+            if vecs_mat is None:
+                continue
+
+            def centroid(ids, vm=vecs_mat):
+                vs = [vm[self._id2idx[j]] for j in ids if j in self._id2idx]
+                if not vs:
+                    return None
+                c = np.mean(vs, axis=0).astype(np.float32)
+                c /= np.linalg.norm(c) + 1e-9
+                return c
+
+            pos_v = centroid(pos_ids)
+            if pos_v is None:
+                continue
+            neg_v = centroid(neg_ids)
+            qv = pos_v - 0.3 * neg_v if neg_v is not None else pos_v
+            qv /= np.linalg.norm(qv) + 1e-9
+
+            scores = self._score_single_index(i, qv, candidate_ids, top_k)
+            if scores:
+                all_scores.append(scores)
+                all_weights.append(w)
+
+        if not all_scores:
             return {}
 
-        def centroid(ids):
-            vs = [vecs_mat[self._id2idx[i]] for i in ids if i in self._id2idx]
-            if not vs:
-                return None
-            c = np.mean(vs, axis=0).astype(np.float32)
-            c /= np.linalg.norm(c) + 1e-9
-            return c
-
-        pos_v = centroid(pos_ids)
-        if pos_v is None:
-            return {}
-        neg_v = centroid(neg_ids)
-        qv = pos_v - 0.3 * neg_v if neg_v is not None else pos_v
-        qv /= np.linalg.norm(qv) + 1e-9
-        return self._score_candidates(qv, candidate_ids, top_k)
+        # Fuse across indices
+        fused: Dict[str, float] = {}
+        for rl, w in zip(all_scores, all_weights):
+            for rank, (doc_id, _) in enumerate(
+                sorted(rl.items(), key=lambda x: x[1], reverse=True), 1
+            ):
+                fused[doc_id] = fused.get(doc_id, 0.0) + w / (60 + rank)
+        return dict(sorted(fused.items(), key=lambda x: x[1], reverse=True)[:top_k])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -762,6 +1180,115 @@ def rrf_fusion(
             scores[doc_id] = scores.get(doc_id, 0.0) + w / (k + rank)
     return scores
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9b. Cold User Handler
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ColdUserHandler:
+    """
+    Provides a CF-BPR proxy vector for cold users (not in User-Embeddings).
+
+    Strategy:
+      1. Group warm users by preferred_musical_culture.
+      2. For each culture, compute the average CF vector ("culture centroid").
+      3. When a cold user's culture is known, return that centroid as their
+         proxy vector so they get personalised CF ranking instead of falling
+         back to pure RRF.
+      4. If culture is unknown, fall back to a global popularity-weighted
+         centroid ("global mean") which at least promotes well-liked tracks.
+
+    Additionally provides a culture→BM25-tokens mapping so retrieval can be
+    seeded with genre/culture keywords for cold users.
+    """
+
+    def __init__(
+        self,
+        user_meta: pd.DataFrame,
+        user_emb: pd.DataFrame,
+    ):
+        # Build user_id → metadata lookup
+        self._user_culture: Dict[str, str] = {}
+        self._user_age_group: Dict[str, str] = {}
+        self._user_country: Dict[str, str] = {}
+
+        for _, row in user_meta.iterrows():
+            uid = str(row.get("user_id", "") or "")
+            if not uid:
+                continue
+            self._user_culture[uid]   = str(row.get("preferred_musical_culture") or "").strip()
+            self._user_age_group[uid] = str(row.get("age_group") or "").strip()
+            self._user_country[uid]   = str(row.get("country_code") or "").strip()
+
+        # Build culture → list of CF vectors from warm users
+        user_cf_map: Dict[str, np.ndarray] = {
+            row["user_id"]: np.array(row["cf-bpr"], dtype=np.float32)
+            for _, row in user_emb[["user_id", "cf-bpr"]].iterrows()
+            if isinstance(row["cf-bpr"], (list, np.ndarray)) and len(row["cf-bpr"]) > 0
+        }
+
+        culture_vecs: Dict[str, List[np.ndarray]] = {}
+        for uid, culture in self._user_culture.items():
+            if uid in user_cf_map and culture:
+                culture_vecs.setdefault(culture, []).append(user_cf_map[uid])
+
+        # Pre-compute culture centroids
+        self._culture_centroids: Dict[str, np.ndarray] = {}
+        for culture, vecs in culture_vecs.items():
+            c = np.mean(vecs, axis=0).astype(np.float32)
+            c /= np.linalg.norm(c) + 1e-9
+            self._culture_centroids[culture] = c
+
+        # Global centroid as last-resort fallback
+        all_vecs = list(user_cf_map.values())
+        if all_vecs:
+            g = np.mean(all_vecs, axis=0).astype(np.float32)
+            g /= np.linalg.norm(g) + 1e-9
+            self._global_centroid: Optional[np.ndarray] = g
+        else:
+            self._global_centroid = None
+
+        n_cultures = len(self._culture_centroids)
+        print(f"[ColdUser] {len(user_cf_map)} warm users, "
+              f"{n_cultures} culture centroids built.")
+
+    def get_proxy_vector(
+        self,
+        user_id: str,
+        override_culture: str = "",
+    ) -> Optional[np.ndarray]:
+        """
+        Return a CF proxy vector for a cold user.
+        override_culture: culture string from user_profile (may be richer than
+                          what's stored in User-Metadata for challenge users).
+        """
+        # Try the provided culture first (from blind_df.user_profile)
+        culture = override_culture or self._user_culture.get(user_id, "")
+
+        if culture and culture in self._culture_centroids:
+            return self._culture_centroids[culture]
+
+        # Fuzzy match: find the closest culture by shared words
+        if culture:
+            culture_words = set(culture.lower().split())
+            best_score, best_vec = 0, None
+            for c_key, c_vec in self._culture_centroids.items():
+                overlap = len(culture_words & set(c_key.lower().split()))
+                if overlap > best_score:
+                    best_score, best_vec = overlap, c_vec
+            if best_vec is not None and best_score >= 1:
+                return best_vec
+
+        return self._global_centroid
+
+    def get_culture(self, user_id: str) -> str:
+        return self._user_culture.get(user_id, "")
+
+    def get_culture_tokens(self, user_id: str, override: str = "") -> List[str]:
+        """Return BM25-friendly tokens from the user's musical culture."""
+        culture = override or self._user_culture.get(user_id, "")
+        return culture.lower().split() if culture else []
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 9. CF-BPR Ranker
@@ -799,23 +1326,29 @@ class CFBPRRanker:
         user_id: str,
         rrf_scores: Dict[str, float],
         top_k: int = TOP_K_FINAL,
+        cold_handler: Optional["ColdUserHandler"] = None,
+        user_culture: str = "",
     ) -> List[ScoredTrack]:
         if not rrf_scores:
             return []
 
-        user_v  = self._user_cf.get(user_id)
+        # Warm user: use their own CF vector
+        # Cold user: use culture-centroid proxy from ColdUserHandler
+        user_v = self._user_cf.get(user_id)
+        is_cold = user_v is None
+        if is_cold and cold_handler is not None:
+            user_v = cold_handler.get_proxy_vector(user_id, override_culture=user_culture)
+
         max_rrf = max(rrf_scores.values()) or 1.0
 
-        # Compute raw CF scores first so we can normalise them
+        # Compute raw CF scores
         raw_cf: Dict[str, float] = {}
         if user_v is not None:
             for tid in rrf_scores:
                 if tid in self._track_cf:
                     raw_cf[tid] = float(np.dot(user_v, self._track_cf[tid]))
 
-        # Normalise CF scores to [0, 1] using min-max over the candidate set.
-        # This prevents CF magnitude from dominating RRF on warm users or being
-        # meaningless on cold users.
+        # Normalise to [0, 1] over the candidate set
         if raw_cf:
             cf_min = min(raw_cf.values())
             cf_max = max(raw_cf.values())
@@ -824,9 +1357,41 @@ class CFBPRRanker:
         else:
             norm_cf = {}
 
-        # Cold user (not in embedding table) → use retrieval score only
-        effective_alpha = 1.0 if not norm_cf else self.alpha
-        effective_beta  = 0.0 if not norm_cf else self.beta
+        # Cold user with proxy: use slightly lower beta to avoid over-relying
+        # on a centroid that may not perfectly represent the individual.
+        # if is_cold and norm_cf:
+        #     effective_alpha = 0.65
+        #     effective_beta  = 0.35
+        # elif not norm_cf:
+        #     effective_alpha = 1.0
+        #     effective_beta  = 0.0
+        # else:
+        #     effective_alpha = self.alpha
+        #     effective_beta  = self.beta
+
+
+        # --- 【方案三：激进重排策略】 ---
+        # 逻辑：如果用户有历史行为（非冷启动），且 CF 模型能打分，则给 CF 高权重
+        
+        # 默认：如果有 CF 分数，就给高权重给 CF (0.7)，让个性化排序主导
+        base_alpha = 0.3
+        base_beta = 0.7
+        
+        # 1. 如果是冷用户（完全没历史），只能依赖 RRF
+        if is_cold:
+            effective_alpha = 1.0
+            effective_beta = 0.0
+            # 注：这里也可以保留 culture centroid，但为了稳定先关掉 CF
+        else:
+            # 2. 温用户/热用户：极度信任 CF 模型的排序能力
+            effective_alpha = base_alpha  # 0.3
+            effective_beta = base_beta    # 0.7
+        
+        # 强制归一化权重和为 1
+        total = effective_alpha + effective_beta
+        effective_alpha /= total
+        effective_beta /= total
+        # --- 【修改结束】 ---
 
         results: List[ScoredTrack] = []
         for tid, rrf_s in rrf_scores.items():
@@ -857,6 +1422,8 @@ class MusicRecPipeline:
         track_meta: pd.DataFrame,
         track_emb: pd.DataFrame,
         user_emb: pd.DataFrame,
+        user_meta: Optional[pd.DataFrame] = None,
+        sessions_df: Optional[pd.DataFrame] = None,
         cache_file: Path = DEFAULT_CACHE_FILE,
         deepseek_api_key: str = DEEPSEEK_API_KEY,
     ):
@@ -874,6 +1441,26 @@ class MusicRecPipeline:
 
         print("[INIT] CF-BPR ranker …")
         self.ranker  = CFBPRRanker(track_emb, user_emb)
+
+        # UserHistoryIndex: per-user taste profile from training sessions
+        if sessions_df is not None and len(sessions_df) > 0:
+            print("[INIT] UserHistoryIndex …")
+            self.user_history: Optional[UserHistoryIndex] = UserHistoryIndex(
+                sessions_df, track_meta
+            )
+        else:
+            print("[INIT] UserHistoryIndex skipped (no sessions_df provided)")
+            self.user_history: Optional[UserHistoryIndex] = None
+
+        # Cold user handler (for users with NO training history)
+        if user_meta is not None and len(user_meta) > 0:
+            print("[INIT] ColdUserHandler …")
+            self.cold_handler: Optional[ColdUserHandler] = ColdUserHandler(
+                user_meta, user_emb
+            )
+        else:
+            print("[INIT] ColdUserHandler skipped (no user_meta provided)")
+            self.cold_handler = None
 
         self._meta   = track_meta.set_index("track_id")
         self._api_key = deepseek_api_key
@@ -893,6 +1480,8 @@ class MusicRecPipeline:
             track_meta=dfs["track_meta"],
             track_emb=dfs["track_emb"],
             user_emb=dfs["user_emb"],
+            user_meta=dfs.get("user_meta"),
+            sessions_df=dfs.get("sessions"),
             cache_file=cache_file,
             deepseek_api_key=deepseek_api_key,
         )
@@ -905,23 +1494,65 @@ class MusicRecPipeline:
         conversation: List[Dict[str, str]],
         top_k: int = TOP_K_FINAL,
         verbose: bool = True,
+        played_track_ids: Optional[List[str]] = None,
+        listener_goal: str = "",
+        user_culture: str = "",
     ) -> Tuple[List[ScoredTrack], ParsedIntent]:
         t0 = time.time()
 
         # 1. Intent
         intent, from_cache = parse_intent(conversation, self.cache, self._api_key)
+
+        # Directly inject played tracks (from current session)
+        if played_track_ids:
+            intent.positive_track_ids = list(dict.fromkeys(
+                intent.positive_track_ids + played_track_ids
+            ))
+
+        # Inject session-level metadata
+        if listener_goal:
+            intent.listener_goal = listener_goal
+        if user_culture:
+            intent.user_culture = user_culture
+
+        # ── Enrich intent with user training history (warm users) ────────────
+        if self.user_history:
+            intent = self.user_history.enrich_intent(user_id, intent)
+            if verbose and self.user_history.has_history(user_id):
+                n_hist = len(self.user_history.get_accepted_tracks(user_id))
+                top_a  = self.user_history.get_top_artists(user_id, 3)
+                print(f"[1b] UserHistory  {n_hist} accepted  top_artists={top_a}")
+
+
+        # Classify retrieval mode from intent structure
+        if not intent.retrieval_mode:
+            intent.retrieval_mode = BM25Retriever._classify_mode(intent)
+
         src = "cache" if from_cache else "API"
         if verbose:
-            print(f"[1] Intent ({src})  abstract={intent.is_abstract}  "
-                  f"decade={intent.decade}  [{intent.year_min},{intent.year_max}]  "
-                  f"genres={intent.genres}  mood={intent.mood}")
+            print(f"[1] Intent ({src})  mode={intent.retrieval_mode}  "
+                  f"abstract={intent.is_abstract}  decade={intent.decade}  "
+                  f"artists={intent.artist_names}  albums={intent.album_names}  "
+                  f"tracks={intent.track_names}  genres={intent.genres}")
 
         # 2. Filter
         filtered = self.filter.apply(intent)
-        cids = filtered["track_id"].tolist() if len(filtered) else None
+        # Use None (= full corpus) only when the filter is completely inactive
+        # (i.e. no filter fields were set). When filter IS active but returns
+        # the full set after relaxation, still use None to avoid passing a
+        # 47k-element list everywhere.
+        filter_active = any([
+            intent.year_min, intent.year_max,
+            intent.popularity_min, intent.popularity_max,
+            intent.duration_min_ms, intent.duration_max_ms,
+        ])
+        if filter_active and len(filtered) < len(self.filter.df):
+            cids: Optional[List[str]] = filtered["track_id"].tolist()
+        else:
+            cids = None
         if verbose:
             n_total = len(self.filter.df)
-            n_pass  = len(filtered) if cids else n_total
+            n_pass  = len(filtered) if cids is not None else n_total
             print(f"[2] Filter  {n_pass:,}/{n_total:,} tracks"
                   + (" (no filter active)" if cids is None else ""))
 
@@ -933,38 +1564,125 @@ class MusicRecPipeline:
 
         # 4. Dense
         dense_scores: Dict[str, float] = {}
-        if intent.semantic_query:
+
+        # 4a. Build enriched semantic query:
+        #     listener_goal (gold label) > semantic_query (DeepSeek) > fallback
+        parts = []
+        if intent.listener_goal:
+            parts.append(intent.listener_goal)
+        if intent.semantic_query and intent.semantic_query not in parts:
+            parts.append(intent.semantic_query)
+        if intent.user_culture:
+            parts.append(intent.user_culture)
+        enriched_query = " ".join(parts).strip()
+
+        if enriched_query:
+            # Temporarily override semantic_query for this call
+            orig_sq = intent.semantic_query
+            intent.semantic_query = enriched_query
             dense_scores = self.dense.retrieve(intent, candidate_ids=cids,
                                                top_k=TOP_K_RETRIEVE)
+            intent.semantic_query = orig_sq
+
+        # 4b. Example-based retrieval from played tracks (strongest recall signal).
+        #     Run even when semantic_query is empty.
         if intent.positive_track_ids:
             ex_scores = self.dense.retrieve_by_example(
                 intent.positive_track_ids, intent.negative_track_ids,
                 candidate_ids=cids, top_k=TOP_K_RETRIEVE,
             )
-            for tid, s in ex_scores.items():
-                dense_scores[tid] = max(dense_scores.get(tid, 0.0), s)
-        if verbose:
-            print(f"[4] Dense   {len(dense_scores)} candidates")
+            if dense_scores:
+                # Fuse via RRF rather than max() so both signals contribute
+                fused: Dict[str, float] = {}
+                for rl, w in [
+                    (dense_scores, 0.4),   # semantic query
+                    (ex_scores,    0.6),   # example similarity (higher weight)
+                ]:
+                    for rank, (tid, _) in enumerate(
+                        sorted(rl.items(), key=lambda x: x[1], reverse=True), 1
+                    ):
+                        fused[tid] = fused.get(tid, 0.0) + w / (60 + rank)
+                dense_scores = fused
+            else:
+                dense_scores = ex_scores
 
-        # 5. RRF (weights adapt to abstraction level)
-        bw = 0.2 if intent.is_abstract else BM25_WEIGHT
-        dw = 0.8 if intent.is_abstract else DENSE_WEIGHT
-        rrf_scores = rrf_fusion([bm25_scores, dense_scores], [bw, dw])
+        if verbose:
+            print(f"[4] Dense   {len(dense_scores)} candidates  "
+                  f"(played={len(intent.positive_track_ids)} example tracks)")
+
+        # 5. RRF – fuse BM25 and Dense
+        # bw = 0.2 if intent.is_abstract else BM25_WEIGHT
+        # dw = 0.8 if intent.is_abstract else DENSE_WEIGHT
+        # rrf_scores = rrf_fusion([bm25_scores, dense_scores], [bw, dw])
+
+        # --- 【方案二修改开始】 --- 
+        # 默认权重
+        bm25_weight = 0.4
+        dense_weight = 0.6
+        
+        # 1. 如果是精确匹配查询（指定了歌手、歌名或专辑），大幅提升 BM25 权重
+        if intent.retrieval_mode in ["exact_track", "exact_artist", "exact_album"]:
+            bm25_weight = 0.7  # 精确查询时，关键词匹配最重要
+            dense_weight = 0.3
+        
+        # 2. 如果是抽象查询（只说心情、流派），则信任语义向量
+        elif intent.retrieval_mode in ["abstract", "genre_mood"]:
+            bm25_weight = 0.3
+            dense_weight = 0.7
+        
+        # 3. 应用融合 (替换原来的 rrf_fusion 调用)
+        rrf_scores = rrf_fusion([bm25_scores, dense_scores], [bm25_weight, dense_weight])
+        # --- 【方案二修改结束】 --- 
+        
         if verbose:
             print(f"[5] RRF     {len(rrf_scores)} candidates  "
                   f"(bm25:{bw:.1f} dense:{dw:.1f})")
 
         # 6. CF-BPR rerank
-        # Request extra candidates so we still have top_k after excluding played
-        n_played = len(intent.positive_track_ids)
-        ranked = self.ranker.rank(user_id, rrf_scores,
-                                   top_k=top_k + n_played + 5)
+        # For cold users: augment BM25 with culture tokens if not already present
+        # if self.cold_handler and (user_id not in self.ranker._user_cf):
+        #     culture_tokens = self.cold_handler.get_culture_tokens(
+        #         user_id, override=user_culture
+        #     )
+        #     if culture_tokens and not intent.user_culture:
+        #         # Re-run BM25 with culture tokens injected (only if not already done)
+        #         intent.user_culture = " ".join(culture_tokens)
+        #         bm25_scores = self.bm25.retrieve(intent, candidate_ids=cids,
+        #                                           top_k=TOP_K_RETRIEVE)
+        #         rrf_scores = rrf_fusion([bm25_scores, dense_scores], [bw, dw])
+        #         if verbose:
+        #             print(f"[3b] BM25 re-run with cold-user culture tokens")
 
-        # Remove already-played tracks from the recommendation list
-        if intent.positive_track_ids:
-            played_set = set(intent.positive_track_ids)
-            ranked = [st for st in ranked if st.track_id not in played_set]
+        # 【修改】：仅在非精确查询时注入文化特征
+        is_cold = (user_id not in self.ranker._user_cf)
+        if self.cold_handler and is_cold:
+            # 仅当查询不是针对特定歌曲/专辑时，才使用文化特征扩充
+            if intent.retrieval_mode in ["abstract", "genre_mood", "default"]:
+                culture_tokens = self.cold_handler.get_culture_tokens(user_id, override=user_culture)
+                if culture_tokens and not intent.user_culture:
+                    intent.user_culture = " ".join(culture_tokens)
+                    # 重新检索，加入文化偏好
+                    bm25_scores = self.bm25.retrieve(intent, candidate_ids=cids, top_k=TOP_K_RETRIEVE)
+                    rrf_scores = rrf_fusion([bm25_scores, dense_scores], [bm25_weight, dense_weight])
+                    if verbose: print(f"[3b] BM25 re-run with cold-user culture tokens")
+
+        n_played = len(intent.positive_track_ids)
+        ranked = self.ranker.rank(
+            user_id, rrf_scores,
+            top_k=top_k + n_played + 5,
+            cold_handler=self.cold_handler,
+            user_culture=user_culture,
+        )
+
+        # Remove already-played AND historically rejected tracks
+        exclude_set = set(intent.positive_track_ids)
+        if self.user_history:
+            exclude_set |= self.user_history.get_rejected_tracks(user_id)
+        if exclude_set:
+            ranked = [st for st in ranked if st.track_id not in exclude_set]
         ranked = ranked[:top_k]
+
+
 
         if verbose:
             print(f"[6] Rerank  top-{len(ranked)}  "
@@ -1110,9 +1828,13 @@ def _demo_synthetic():
         {"user_id": "u1", "cf-bpr": rng.normal(size=128).tolist()}
     ])
 
+    user_meta = pd.DataFrame([
+        {"user_id": "u1", "age": 22, "age_group": "20s", "country_code": "US",
+         "preferred_musical_culture": "Alternative Rock"},
+    ])
     cache_file = Path("./cache/intent_demo.jsonl")
     pipeline = MusicRecPipeline(tracks, track_emb, user_emb,
-                                cache_file=cache_file)
+                                user_meta=user_meta, cache_file=cache_file)
 
     print("=" * 65)
     print("TEST 1 — concrete: Green Day 2000s")
@@ -1179,12 +1901,17 @@ def _generate_response(
         track_lines.append(line)
     tracks_block = "\n".join(track_lines) if track_lines else "- (no tracks)"
 
-    # Full conversation context (last 6 turns) so the model understands the dialogue
+    # conversation here is already response_history (clean user/assistant only).
+    # Take last 6 turns; skip any accidentally injected non-natural-language lines.
+    _UUID_RE = re.compile(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I
+    )
     conv_text = "\n".join(
         f"{m['role'].capitalize()}: {m['content']}"
         for m in conversation[-6:]
         if m.get("content", "").strip()
         and not m["content"].startswith("[Previously played")
+        and not _UUID_RE.search(m["content"])   # drop any UUID-containing lines
     )
 
     prompt = (
@@ -1233,34 +1960,47 @@ def _generate_response(
         )
 
 
-def _build_conversation_history(turns: List[Dict]) -> List[Dict[str, str]]:
+def _build_conversation_history(
+    turns: List[Dict],
+) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
     """
-    Convert blind-A conversation turns into {role, content} dicts.
+    Convert blind-A conversation turns into two separate history lists:
 
-    Role mapping:
-      user      → user
-      assistant → assistant  (natural-language replies)
-      music     → skipped for intent parsing (track_id, not text);
-                  BUT the associated 'thought' field (assistant reasoning)
-                  is included as an assistant turn when present, because it
-                  carries useful context about why a track was chosen.
+    intent_history  – used for DeepSeek intent parsing.
+                      Includes user turns, assistant turns, AND the 'thought'
+                      field from music turns (internal reasoning about why a
+                      track was chosen – useful context for understanding intent).
+
+    response_history – used for DeepSeek response generation.
+                       Only clean natural-language user ↔ assistant exchanges.
+                       NO thought strings, NO UUID-containing lines.
+                       This keeps the response prompt uncluttered.
     """
-    history = []
+    intent_history: List[Dict[str, str]]   = []
+    response_history: List[Dict[str, str]] = []
+
     for t in turns:
         role    = t.get("role", "")
         content = (t.get("content", "") or "").strip()
         thought = (t.get("thought", "") or "").strip()
 
         if role == "user" and content:
-            history.append({"role": "user", "content": content})
+            intent_history.append({"role": "user", "content": content})
+            response_history.append({"role": "user", "content": content})
+
         elif role == "assistant" and content:
-            history.append({"role": "assistant", "content": content})
+            intent_history.append({"role": "assistant", "content": content})
+            response_history.append({"role": "assistant", "content": content})
+
         elif role == "music":
-            # Include the assistant's thought (recommendation rationale) if present
+            # thought → intent context only (may contain UUIDs / internal notes)
             if thought:
-                history.append({"role": "assistant", "content": thought})
-        # system turns: skip
-    return history
+                intent_history.append({"role": "assistant", "content": thought})
+            # response_history: skip entirely (track_id + thought not user-facing)
+
+        # system turns: skip both
+
+    return intent_history, response_history
 
 
 def _extract_positive_ids_from_history(turns: List[Dict]) -> List[str]:
@@ -1350,10 +2090,10 @@ def predict_blind_a(
                   f"turn_number={turn_number}  "
                   f"elapsed={elapsed:.0f}s  eta={eta:.0f}s")
 
-        # ── Build conversation context for intent parsing ──────────────────
-        history = _build_conversation_history(turns)
+        # ── Build conversation context ────────────────────────────────────
+        intent_history, response_history = _build_conversation_history(turns)
 
-        if not history:
+        if not intent_history:
             # No user turn at all – skip gracefully
             msg = f"[SKIP] No user turns in session {session_id}"
             if _tqdm_available:
@@ -1362,18 +2102,32 @@ def predict_blind_a(
                 print(msg)
             continue
 
-        # Inject previously played tracks as positive examples
+        # Extract previously played tracks and pass them directly into recommend()
+        # rather than embedding them as a text hint (which DeepSeek often misses).
         played_ids = _extract_positive_ids_from_history(turns)
-        if played_ids and history:
-            hint = f"[Previously played: {', '.join(played_ids[:5])}]"
-            history = history + [{"role": "assistant", "content": hint}]
+
+        # ── Extract session-level metadata (not in conversation text) ──────
+        user_profile = row.get("user_profile") or {}
+        if isinstance(user_profile, str):
+            try: user_profile = json.loads(user_profile)
+            except: user_profile = {}
+        conv_goal = row.get("conversation_goal") or {}
+        if isinstance(conv_goal, str):
+            try: conv_goal = json.loads(conv_goal)
+            except: conv_goal = {}
+
+        listener_goal = str(conv_goal.get("listener_goal") or "").strip()
+        user_culture  = str(user_profile.get("preferred_musical_culture") or "").strip()
 
         # ── Recommend ─────────────────────────────────────────────────────────
         try:
             ranked, intent = pipeline.recommend(
-                user_id, history,
+                user_id, intent_history,
                 top_k=top_k,
                 verbose=False,
+                played_track_ids=played_ids if played_ids else None,
+                listener_goal=listener_goal,
+                user_culture=user_culture,
             )
         except Exception as e:
             msg = f"[ERROR] recommend() failed for {session_id[:8]}: {e}"
@@ -1395,9 +2149,10 @@ def predict_blind_a(
                 predicted_ids.append(st.track_id)
 
         # ── Generate natural language response ────────────────────────────────
+        # Use response_history (clean turns only) so the prompt stays uncluttered.
         if generate_response and ranked:
             response_text = _generate_response(
-                history, ranked,
+                response_history, ranked,
                 api_key=pipeline._api_key,
             )
         else:
