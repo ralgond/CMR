@@ -1374,8 +1374,8 @@ class CFBPRRanker:
         # 逻辑：如果用户有历史行为（非冷启动），且 CF 模型能打分，则给 CF 高权重
         
         # 默认：如果有 CF 分数，就给高权重给 CF (0.7)，让个性化排序主导
-        base_alpha = 0.3
-        base_beta = 0.7
+        base_alpha = 0.85
+        base_beta  = 0.15
         
         # 1. 如果是冷用户（完全没历史），只能依赖 RRF
         if is_cold:
