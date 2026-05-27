@@ -168,6 +168,11 @@ class ParsedIntent:
 
     positive_track_ids: List[str]   = field(default_factory=list)
     negative_track_ids: List[str]   = field(default_factory=list)
+    # Weighted version of positive_track_ids: List of (track_id, weight) where
+    # weight = exp(-lam * i), i=0 for the most recently accepted track.
+    # Populated by UserHistoryIndex.enrich_intent(); falls back to uniform
+    # weights (all 1.0) when not set.
+    weighted_positive_track_ids: List[Tuple[str, float]] = field(default_factory=list)
 
     # Extra context injected from session metadata (not from DeepSeek)
     listener_goal:      str         = ""   # conversation_goal.listener_goal
@@ -350,10 +355,28 @@ class UserHistoryIndex:
     def has_history(self, user_id: str) -> bool:
         return len(self._profiles.get(user_id, {}).get("accepted_track_ids", [])) > 0
 
-    def get_accepted_tracks(self, user_id: str, max_recent: int = 10) -> List[str]:
+    def get_accepted_tracks(self, user_id: str, max_recent: int = 30) -> List[str]:
         """Most recent accepted track_ids (best seed for dense retrieval)."""
         tracks = self._profiles.get(user_id, {}).get("accepted_track_ids", [])
         return tracks[-max_recent:]
+
+    def get_accepted_tracks_weighted(
+        self, user_id: str, max_recent: int = 30, lam: float = 0.15
+    ) -> List[Tuple[str, float]]:
+        """
+        Return (track_id, weight) pairs where weight decays exponentially
+        with distance from the most recent accepted interaction.
+
+        weight_i = exp(-lam * i),  i=0 for the newest accepted track.
+
+        lam=0.15: track accepted 10 steps ago → weight ≈ 0.22,
+        so recent preferences dominate without discarding older ones entirely.
+        """
+        import math
+        tracks = self._profiles.get(user_id, {}).get("accepted_track_ids", [])
+        recent = tracks[-max_recent:]           # oldest … newest slice
+        # i=0 → newest (weight=1.0), i increases toward older tracks
+        return [(tid, math.exp(-lam * i)) for i, tid in enumerate(reversed(recent))]
 
     def get_rejected_tracks(self, user_id: str) -> set:
         return set(self._profiles.get(user_id, {}).get("rejected_track_ids", []))
@@ -380,10 +403,19 @@ class UserHistoryIndex:
         if not self.has_history(user_id):
             return intent
 
-        hist_tracks = self.get_accepted_tracks(user_id, max_recent=10)
-        # Merge: history first, current session last (more recent = higher weight)
+        # ── weighted history tracks (exponential time decay) ─────────────────
+        weighted = self.get_accepted_tracks_weighted(user_id, max_recent=30)
+        hist_tracks = [tid for tid, _ in weighted]   # newest-first order
+
+        # Merge: history seeds first, current session (more recent) appended last
         combined = list(dict.fromkeys(hist_tracks + intent.positive_track_ids))
         intent.positive_track_ids = combined
+
+        # Weighted list for centroid computation: current-session tracks get
+        # weight=1.0 (they're the most relevant signal for this turn).
+        session_weighted = [(tid, 1.0) for tid in intent.positive_track_ids
+                            if tid not in {t for t, _ in weighted}]
+        intent.weighted_positive_track_ids = weighted + session_weighted
 
         # Enrich negative tracks
         rejected = self.get_rejected_tracks(user_id)
@@ -1097,7 +1129,7 @@ class DenseRetriever:
             for rank, (doc_id, _) in enumerate(
                 sorted(rl.items(), key=lambda x: x[1], reverse=True), start=1
             ):
-                fused[doc_id] = fused.get(doc_id, 0.0) + w / (60 + rank)
+                fused[doc_id] = fused.get(doc_id, 0.0) + w / (10 + rank)
         return dict(sorted(fused.items(), key=lambda x: x[1], reverse=True)[:top_k])
 
     def retrieve(
@@ -1117,24 +1149,47 @@ class DenseRetriever:
         neg_ids: List[str],
         candidate_ids: Optional[List[str]] = None,
         top_k: int = TOP_K_RETRIEVE,
+        pos_weights: Optional[List[float]] = None,
     ) -> Dict[str, float]:
         """
         Score each available index independently using the centroid of played
         tracks, then fuse with RRF. This is better than using only index 0
         because different indices capture different aspects (style, lyrics, audio).
+
+        pos_weights: optional per-track weights aligned with pos_ids.
+                     If provided, the centroid is a weighted average instead of
+                     a simple mean, giving more influence to recently accepted
+                     tracks (time-decay from UserHistoryIndex).
         """
         all_scores: List[Dict[str, float]] = []
         all_weights: List[float] = []
+
+        # Build a id→weight lookup for safe access regardless of which ids
+        # list (pos or neg) centroid() is called with.
+        if pos_weights is not None and len(pos_weights) == len(pos_ids):
+            _weight_map: Optional[Dict[str, float]] = {
+                tid: float(w) for tid, w in zip(pos_ids, pos_weights)
+            }
+        else:
+            _weight_map = None
 
         for i, (vecs_mat, w) in enumerate(zip(self._vecs_list, self.EMB_WEIGHTS)):
             if vecs_mat is None:
                 continue
 
-            def centroid(ids, vm=vecs_mat):
-                vs = [vm[self._id2idx[j]] for j in ids if j in self._id2idx]
+            def centroid(ids, wmap=_weight_map, vm=vecs_mat):
+                vs, ws = [], []
+                for j in ids:
+                    if j not in self._id2idx:
+                        continue
+                    vs.append(vm[self._id2idx[j]])
+                    ws.append(wmap[j] if (wmap is not None and j in wmap) else 1.0)
                 if not vs:
                     return None
-                c = np.mean(vs, axis=0).astype(np.float32)
+                ws_arr = np.array(ws, dtype=np.float32)
+                ws_arr /= ws_arr.sum() + 1e-9
+                c = np.stack(vs).T @ ws_arr
+                c = c.astype(np.float32)
                 c /= np.linalg.norm(c) + 1e-9
                 return c
 
@@ -1159,7 +1214,7 @@ class DenseRetriever:
             for rank, (doc_id, _) in enumerate(
                 sorted(rl.items(), key=lambda x: x[1], reverse=True), 1
             ):
-                fused[doc_id] = fused.get(doc_id, 0.0) + w / (60 + rank)
+                fused[doc_id] = fused.get(doc_id, 0.0) + w / (10 + rank)
         return dict(sorted(fused.items(), key=lambda x: x[1], reverse=True)[:top_k])
 
 
@@ -1170,7 +1225,7 @@ class DenseRetriever:
 def rrf_fusion(
     ranked_lists: List[Dict[str, float]],
     weights: List[float],
-    k: int = 60,
+    k: int = 10,
 ) -> Dict[str, float]:
     scores: Dict[str, float] = {}
     for rl, w in zip(ranked_lists, weights):
@@ -1411,7 +1466,425 @@ class CFBPRRanker:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 10. Full Pipeline
+# 10. LightGBM LambdaRank Reranker
+# ─────────────────────────────────────────────────────────────────────────────
+
+RERANKER_MODEL_FILE = Path("./cache/lgbm_reranker.pkl")
+
+GOAL_TYPE_VOCAB    = list("ABCDEFGHIJK")
+SPECIFICITY_VOCAB  = ["HH", "HL", "LH", "LL"]
+RETRIEVAL_MODES    = ["exact_track", "exact_artist", "exact_album",
+                      "genre_mood", "abstract", "default"]
+
+def _enc_onehot(val: str, vocab: List[str]) -> List[float]:
+    return [1.0 if val == v else 0.0 for v in vocab]
+
+
+class LGBMReranker:
+    """
+    LightGBM LambdaRank reranker that re-scores CFBPRRanker output.
+
+    Features per candidate (20-dim):
+      rrf_score, bm25_score, dense_score, cf_score   (4)
+      rank_in_cf                                      (1)
+      popularity, release_year                        (2)
+      tag_overlap_with_intent                         (1)
+      artist_match_with_intent                        (1)
+      user_accepted_this_artist (history count)       (1)
+      user_accepted_count (total warm history)        (1)
+      turn_number                                     (1)
+      goal_type one-hot (A-K = 11 dims)               (11)
+      specificity one-hot (HH/HL/LH/LL = 4 dims)      (4)
+      retrieval_mode one-hot (6 dims)                  (6)
+    Total: 33 features
+    """
+
+    FEATURE_NAMES: List[str] = (
+        ["rrf_score", "bm25_score", "dense_score", "cf_score",
+         "rank_in_cf", "popularity", "release_year",
+         "tag_overlap", "artist_match",
+         "user_accepted_artist", "user_accepted_count",
+         "turn_number"]
+        + [f"goal_{g}" for g in GOAL_TYPE_VOCAB]
+        + [f"spec_{s}" for s in SPECIFICITY_VOCAB]
+        + [f"mode_{m}" for m in RETRIEVAL_MODES]
+    )
+
+    def __init__(self):
+        self._model = None   # lgb.Booster, loaded after train() or load()
+
+    # ── Feature extraction ───────────────────────────────────────────────────
+
+    @staticmethod
+    def extract_features(
+        candidates: List[ScoredTrack],
+        intent: "ParsedIntent",
+        track_meta_index: pd.DataFrame,   # indexed by track_id
+        user_history: Optional["UserHistoryIndex"],
+        user_id: str,
+        turn_number: int,
+        goal_type: str = "",
+        specificity: str = "",
+    ) -> np.ndarray:
+        """Return (n_candidates, n_features) float32 array."""
+
+        intent_tags    = set(intent.genres + intent.mood + intent.themes)
+        intent_artists = {a.lower() for a in intent.artist_names}
+        goal_oh   = _enc_onehot(goal_type,   GOAL_TYPE_VOCAB)
+        spec_oh   = _enc_onehot(specificity, SPECIFICITY_VOCAB)
+        mode_oh   = _enc_onehot(intent.retrieval_mode, RETRIEVAL_MODES)
+
+        user_accepted_count = 0
+        accepted_artist_cnt: Dict[str, int] = {}
+        if user_history and user_history.has_history(user_id):
+            profile = user_history._profiles.get(user_id, {})
+            user_accepted_count = len(profile.get("accepted_track_ids", []))
+            accepted_artist_cnt = dict(profile.get("accepted_artists", {}))
+
+        rows = []
+        for rank_i, st in enumerate(candidates):
+            meta = track_meta_index.loc[st.track_id] \
+                   if st.track_id in track_meta_index.index else None
+
+            popularity   = float(meta.get("popularity",    0) or 0) if meta is not None else 0.0
+            release_year = 0.0
+            if meta is not None:
+                rd = str(meta.get("release_date", "") or "")
+                m  = re.match(r"(\d{4})", rd)
+                release_year = float(m.group(1)) if m else 0.0
+
+            # tag overlap: Jaccard between intent tags and track tags
+            track_tags = []
+            if meta is not None:
+                tv = meta.get("tag_list")
+                if isinstance(tv, (list, np.ndarray)):
+                    track_tags = [str(t).lower() for t in tv]
+                elif isinstance(tv, str):
+                    track_tags = [tv.lower()]
+            track_tag_set = set(track_tags)
+            tag_overlap = (len(intent_tags & track_tag_set) /
+                           max(len(intent_tags | track_tag_set), 1))
+
+            # artist match
+            artist_match = 0.0
+            if meta is not None:
+                av = meta.get("artist_name")
+                artists = av if isinstance(av, (list, np.ndarray)) else [av]
+                for a in artists:
+                    if a and str(a).lower() in intent_artists:
+                        artist_match = 1.0
+                        break
+
+            # user history: how many times user accepted this track's artist
+            user_artist_cnt = 0.0
+            if meta is not None:
+                av = meta.get("artist_name")
+                artists = av if isinstance(av, (list, np.ndarray)) else [av]
+                for a in artists:
+                    if a:
+                        user_artist_cnt = float(
+                            accepted_artist_cnt.get(str(a), 0)
+                        )
+                        break
+
+            row = (
+                [st.rrf_score, st.bm25_score, st.dense_score, st.cf_score,
+                 float(rank_i),
+                 popularity, release_year,
+                 tag_overlap, artist_match,
+                 user_artist_cnt, float(user_accepted_count),
+                 float(turn_number)]
+                + goal_oh + spec_oh + mode_oh
+            )
+            rows.append(row)
+
+        return np.array(rows, dtype=np.float32)
+
+    # ── Inference ────────────────────────────────────────────────────────────
+
+    def rerank(
+        self,
+        candidates: List[ScoredTrack],
+        intent: "ParsedIntent",
+        track_meta_index: pd.DataFrame,
+        user_history: Optional["UserHistoryIndex"],
+        user_id: str,
+        turn_number: int,
+        goal_type: str = "",
+        specificity: str = "",
+    ) -> List[ScoredTrack]:
+        if self._model is None or not candidates:
+            return candidates
+
+        X = self.extract_features(
+            candidates, intent, track_meta_index,
+            user_history, user_id, turn_number,
+            goal_type, specificity,
+        )
+        scores = self._model.predict(X)
+        for st, s in zip(candidates, scores):
+            st.final_score = float(s)
+        candidates.sort(key=lambda x: x.final_score, reverse=True)
+        return candidates
+
+    # ── Persistence ──────────────────────────────────────────────────────────
+
+    def save(self, path: Path = RERANKER_MODEL_FILE):
+        import pickle
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "wb") as f:
+            pickle.dump(self._model, f)
+        print(f"[LGBMReranker] saved → {path}")
+
+    def load(self, path: Path = RERANKER_MODEL_FILE) -> bool:
+        import pickle
+        if not path.exists():
+            return False
+        with open(path, "rb") as f:
+            self._model = pickle.load(f)
+        print(f"[LGBMReranker] loaded ← {path}")
+        return True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10b. Reranker Training
+# ─────────────────────────────────────────────────────────────────────────────
+
+def train_reranker(
+    pipeline: "MusicRecPipeline",
+    sessions_df: pd.DataFrame,
+    max_sessions: int = 2000,
+    candidate_pool: int = 100,
+    model_path: Path = RERANKER_MODEL_FILE,
+    n_estimators: int = 400,
+    num_leaves: int = 63,
+    learning_rate: float = 0.05,
+) -> LGBMReranker:
+    """
+    Build training data from sessions, train LightGBM LambdaRank, return
+    a fitted LGBMReranker.
+
+    For each (session, music turn):
+      - Run pipeline.recommend(top_k=candidate_pool) to get candidates + scores
+      - Label ground-truth track as rel=1, all others as rel=0
+      - Extract LGBMReranker features for each candidate
+    """
+    try:
+        import lightgbm as lgb  # type: ignore
+    except ImportError:
+        raise ImportError("pip install lightgbm")
+
+    print(f"[train_reranker] Building training data "
+          f"(max_sessions={max_sessions}, pool={candidate_pool}) …")
+
+    all_X:      List[np.ndarray] = []
+    all_y:      List[int]        = []
+    all_groups: List[int]        = []
+
+    n_sessions_done = 0
+    n_turns_done    = 0
+    n_positive      = 0
+
+    try:
+        from tqdm import tqdm as _tqdm
+        pbar = _tqdm(total=min(max_sessions, len(sessions_df)),
+                     desc="[train_reranker] sessions",
+                     unit="sess", dynamic_ncols=True)
+    except ImportError:
+        pbar = None
+
+    for _, sess in sessions_df.iterrows():
+        if n_sessions_done >= max_sessions:
+            break
+
+        def _safe_list(v):
+            if v is None: return []
+            if isinstance(v, (list, np.ndarray)): return list(v)
+            if isinstance(v, str):
+                try: return json.loads(v)
+                except: return []
+            return []
+
+        def _safe_dict(v):
+            if v is None: return {}
+            if isinstance(v, dict): return v
+            if isinstance(v, str):
+                try: return json.loads(v)
+                except: return {}
+            return {}
+
+        user_id     = str(sess["user_id"])
+        turns       = _safe_list(sess.get("conversations"))
+        conv_goal   = _safe_dict(sess.get("conversation_goal"))
+        goal_type   = str(conv_goal.get("goal_type")   or "").strip()
+        specificity = str(conv_goal.get("specificity") or "").strip()
+        user_culture = str(_safe_dict(sess.get("user_profile")).get(
+            "preferred_musical_culture", "") or "")
+
+        assessments = _safe_list(sess.get("goal_progress_assessments"))
+        assess_map: Dict[int, str] = {}
+        for a in assessments:
+            if not isinstance(a, dict):
+                try: a = json.loads(a)
+                except: continue
+            tn  = a.get("turn_number")
+            gpa = str(a.get("goal_progress_assessment") or "")
+            if tn is not None:
+                try: assess_map[int(tn)] = gpa
+                except: pass
+
+        history: List[Dict[str, str]] = []
+        music_turn_idx = 0
+
+        for t in turns:
+            if not isinstance(t, dict):
+                continue
+            role    = str(t.get("role", ""))
+            content = str(t.get("content") or "").strip()
+            turn_no = t.get("turn_number")
+
+            if role == "user":
+                history.append({"role": "user", "content": content})
+
+            elif role == "music" and content:
+                music_turn_idx += 1
+                gpa = assess_map.get(int(turn_no) if turn_no is not None else -1, "")
+                # Only use turns where we know the ground truth
+                if gpa not in ("MOVES_TOWARD_GOAL", "DOES_NOT_MOVE_TOWARD_GOAL"):
+                    history.append({"role": "assistant",
+                                    "content": f"[played:{content}]"})
+                    continue
+
+                ground_truth_id = content if gpa == "MOVES_TOWARD_GOAL" else None
+
+                try:
+                    candidates, intent = pipeline.recommend(
+                        user_id, history,
+                        top_k=candidate_pool,
+                        verbose=False,
+                        listener_goal=str(conv_goal.get("listener_goal") or ""),
+                        user_culture=user_culture,
+                    )
+                except Exception as e:
+                    print(f"[WARN] recommend failed for {user_id}: {e}")
+                    history.append({"role": "assistant",
+                                    "content": f"[played:{content}]"})
+                    continue
+
+                if not candidates:
+                    history.append({"role": "assistant",
+                                    "content": f"[played:{content}]"})
+                    continue
+
+                # If ground truth not in candidate pool, inject it at the end
+                # so the model sees at least one positive per group
+                cand_ids = {st.track_id for st in candidates}
+                if ground_truth_id and ground_truth_id not in cand_ids:
+                    # Build a minimal ScoredTrack for the injected positive
+                    candidates.append(ScoredTrack(
+                        track_id=ground_truth_id,
+                        rrf_score=0.0, bm25_score=0.0,
+                        dense_score=0.0, cf_score=0.0,
+                        final_score=0.0,
+                    ))
+
+                X_group = LGBMReranker.extract_features(
+                    candidates, intent,
+                    pipeline._meta,
+                    pipeline.user_history,
+                    user_id,
+                    turn_number=music_turn_idx,
+                    goal_type=goal_type,
+                    specificity=specificity,
+                )
+                y_group = [
+                    1 if (ground_truth_id and st.track_id == ground_truth_id)
+                    else 0
+                    for st in candidates
+                ]
+
+                if sum(y_group) == 0:
+                    history.append({"role": "assistant",
+                                    "content": f"[played:{content}]"})
+                    continue
+
+                all_X.append(X_group)
+                all_y.extend(y_group)
+                all_groups.append(len(candidates))
+                n_positive    += sum(y_group)
+                n_turns_done  += 1
+
+                history.append({"role": "assistant",
+                                "content": f"[played:{content}]"})
+
+        n_sessions_done += 1
+        if pbar is not None:
+            pbar.update(1)
+            pbar.set_postfix(turns=n_turns_done, pos=n_positive, refresh=False)
+        elif n_sessions_done % 100 == 0:
+            print(f"  … {n_sessions_done}/{max_sessions} sessions  "
+                  f"{n_turns_done} turns  {n_positive} positives")
+
+    if pbar is not None:
+        pbar.close()
+
+    if not all_X:
+        raise ValueError("No training samples collected — check pipeline and data.")
+
+    X = np.vstack(all_X)
+    y = np.array(all_y, dtype=np.float32)
+    print(f"\n[train_reranker] Dataset: {len(all_groups)} groups, "
+          f"{len(y)} samples, {n_positive} positives "
+          f"({100*n_positive/len(y):.2f}%)")
+
+    train_ds = lgb.Dataset(
+        X, label=y,
+        group=all_groups,
+        feature_name=LGBMReranker.FEATURE_NAMES,
+        free_raw_data=False,
+    )
+
+    params = {
+        "objective":        "lambdarank",
+        "metric":           "ndcg",
+        "ndcg_eval_at":     [5, 10, 20],
+        "lambdarank_truncation_level": 20,
+        "num_leaves":       num_leaves,
+        "learning_rate":    learning_rate,
+        "min_data_in_leaf": 5,
+        "feature_fraction": 0.8,
+        "bagging_fraction": 0.8,
+        "bagging_freq":     5,
+        "verbose":          -1,
+    }
+
+    print(f"[train_reranker] Training LightGBM LambdaRank "
+          f"(n_estimators={n_estimators}) …")
+    booster = lgb.train(
+        params,
+        train_ds,
+        num_boost_round=n_estimators,
+        callbacks=[lgb.log_evaluation(50)],
+    )
+
+    reranker = LGBMReranker()
+    reranker._model = booster
+    reranker.save(model_path)
+
+    # Feature importance
+    imp = sorted(
+        zip(LGBMReranker.FEATURE_NAMES, booster.feature_importance("gain")),
+        key=lambda x: x[1], reverse=True,
+    )
+    print("\n[train_reranker] Top-10 feature importance (gain):")
+    for fname, gain in imp[:10]:
+        print(f"  {fname:<30s} {gain:.1f}")
+
+    return reranker
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 11. Full Pipeline
 # ─────────────────────────────────────────────────────────────────────────────
 
 class MusicRecPipeline:
@@ -1464,6 +1937,12 @@ class MusicRecPipeline:
 
         self._meta   = track_meta.set_index("track_id")
         self._api_key = deepseek_api_key
+
+        # LightGBM reranker – loaded from disk if available, else disabled
+        print("[INIT] LGBMReranker …")
+        self.reranker_lgbm = LGBMReranker()
+        if not self.reranker_lgbm.load(RERANKER_MODEL_FILE):
+            print("[INIT] LGBMReranker not found – run pipeline.train_reranker()")
         print("[INIT] Pipeline ready.\n")
 
     # ── Factory ──────────────────────────────────────────────────────────────
@@ -1497,6 +1976,9 @@ class MusicRecPipeline:
         played_track_ids: Optional[List[str]] = None,
         listener_goal: str = "",
         user_culture: str = "",
+        goal_type: str = "",
+        specificity: str = "",
+        turn_number: int = 0,
     ) -> Tuple[List[ScoredTrack], ParsedIntent]:
         t0 = time.time()
 
@@ -1565,6 +2047,8 @@ class MusicRecPipeline:
         # 4. Dense
         dense_scores: Dict[str, float] = {}
 
+        _has_entity = bool(intent.artist_names or intent.track_names)
+
         # 4a. Build enriched semantic query:
         #     listener_goal (gold label) > semantic_query (DeepSeek) > fallback
         parts = []
@@ -1577,7 +2061,6 @@ class MusicRecPipeline:
         enriched_query = " ".join(parts).strip()
 
         if enriched_query:
-            # Temporarily override semantic_query for this call
             orig_sq = intent.semantic_query
             intent.semantic_query = enriched_query
             dense_scores = self.dense.retrieve(intent, candidate_ids=cids,
@@ -1587,21 +2070,28 @@ class MusicRecPipeline:
         # 4b. Example-based retrieval from played tracks (strongest recall signal).
         #     Run even when semantic_query is empty.
         if intent.positive_track_ids:
+            if intent.weighted_positive_track_ids:
+                _w_map = {tid: wt for tid, wt in intent.weighted_positive_track_ids}
+                pos_weights = [_w_map.get(tid, 1.0)
+                               for tid in intent.positive_track_ids]
+            else:
+                pos_weights = None
+
             ex_scores = self.dense.retrieve_by_example(
                 intent.positive_track_ids, intent.negative_track_ids,
                 candidate_ids=cids, top_k=TOP_K_RETRIEVE,
+                pos_weights=pos_weights,
             )
             if dense_scores:
-                # Fuse via RRF rather than max() so both signals contribute
                 fused: Dict[str, float] = {}
                 for rl, w in [
-                    (dense_scores, 0.4),   # semantic query
-                    (ex_scores,    0.6),   # example similarity (higher weight)
+                    (dense_scores, 0.4),
+                    (ex_scores,    0.6),
                 ]:
                     for rank, (tid, _) in enumerate(
                         sorted(rl.items(), key=lambda x: x[1], reverse=True), 1
                     ):
-                        fused[tid] = fused.get(tid, 0.0) + w / (60 + rank)
+                        fused[tid] = fused.get(tid, 0.0) + w / (10 + rank)
                 dense_scores = fused
             else:
                 dense_scores = ex_scores
@@ -1619,24 +2109,30 @@ class MusicRecPipeline:
         # 默认权重
         bm25_weight = 0.4
         dense_weight = 0.6
-        
-        # 1. 如果是精确匹配查询（指定了歌手、歌名或专辑），大幅提升 BM25 权重
-        if intent.retrieval_mode in ["exact_track", "exact_artist", "exact_album"]:
-            bm25_weight = 0.7  # 精确查询时，关键词匹配最重要
+
+        # 1. 有明确艺人或曲名时，BM25 文本匹配最可靠
+        if _has_entity:
+            bm25_weight = 0.8
+            dense_weight = 0.2
+
+        # 2. 如果是精确匹配查询（指定了歌手、歌名或专辑），大幅提升 BM25 权重
+        elif intent.retrieval_mode in ["exact_track", "exact_artist", "exact_album"]:
+            bm25_weight = 0.7
             dense_weight = 0.3
         
-        # 2. 如果是抽象查询（只说心情、流派），则信任语义向量
+        # 3. 如果是抽象查询（只说心情、流派），则信任语义向量
         elif intent.retrieval_mode in ["abstract", "genre_mood"]:
             bm25_weight = 0.3
             dense_weight = 0.7
         
-        # 3. 应用融合 (替换原来的 rrf_fusion 调用)
+        # 4. 应用融合 (替换原来的 rrf_fusion 调用)
         rrf_scores = rrf_fusion([bm25_scores, dense_scores], [bm25_weight, dense_weight])
-        # --- 【方案二修改结束】 --- 
+        # --- 【方案二修改结束】 ---
+
         
         if verbose:
             print(f"[5] RRF     {len(rrf_scores)} candidates  "
-                  f"(bm25:{bw:.1f} dense:{dw:.1f})")
+                  f"(bm25:{bm25_weight:.1f} dense:{dense_weight:.1f})")
 
         # 6. CF-BPR rerank
         # For cold users: augment BM25 with culture tokens if not already present
@@ -1682,7 +2178,19 @@ class MusicRecPipeline:
             ranked = [st for st in ranked if st.track_id not in exclude_set]
         ranked = ranked[:top_k]
 
-
+        # 7. LightGBM LambdaRank reranker (if trained)
+        if self.reranker_lgbm._model is not None:
+            ranked = self.reranker_lgbm.rerank(
+                ranked, intent,
+                track_meta_index=self._meta,
+                user_history=self.user_history,
+                user_id=user_id,
+                turn_number=turn_number,
+                goal_type=goal_type,
+                specificity=specificity,
+            )
+            if verbose:
+                print(f"[7] LGBMReranker applied")
 
         if verbose:
             print(f"[6] Rerank  top-{len(ranked)}  "
@@ -1720,6 +2228,24 @@ class MusicRecPipeline:
                 }
 
         return ranked, intent
+
+    def train_reranker(
+        self,
+        sessions_df: pd.DataFrame,
+        max_sessions: int = 2000,
+        candidate_pool: int = 100,
+        model_path: Path = RERANKER_MODEL_FILE,
+        **kwargs,
+    ) -> "LGBMReranker":
+        """Train LGBMReranker and hot-swap it into this pipeline instance."""
+        self.reranker_lgbm = train_reranker(
+            self, sessions_df,
+            max_sessions=max_sessions,
+            candidate_pool=candidate_pool,
+            model_path=model_path,
+            **kwargs,
+        )
+        return self.reranker_lgbm
 
     def format_results(self, ranked: List[ScoredTrack]) -> str:
         lines = []
@@ -2107,13 +2633,18 @@ def predict_blind_a(
         played_ids = _extract_positive_ids_from_history(turns)
 
         # ── Extract session-level metadata (not in conversation text) ──────
-        user_profile = row.get("user_profile") or {}
-        if isinstance(user_profile, str):
-            try: user_profile = json.loads(user_profile)
+        user_profile = row.get("user_profile")
+        if isinstance(user_profile, (list, np.ndarray)):
+            user_profile = user_profile[0] if len(user_profile) > 0 else {}
+        if not isinstance(user_profile, dict):
+            try: user_profile = json.loads(str(user_profile))
             except: user_profile = {}
-        conv_goal = row.get("conversation_goal") or {}
-        if isinstance(conv_goal, str):
-            try: conv_goal = json.loads(conv_goal)
+
+        conv_goal = row.get("conversation_goal")
+        if isinstance(conv_goal, (list, np.ndarray)):
+            conv_goal = conv_goal[0] if len(conv_goal) > 0 else {}
+        if not isinstance(conv_goal, dict):
+            try: conv_goal = json.loads(str(conv_goal))
             except: conv_goal = {}
 
         listener_goal = str(conv_goal.get("listener_goal") or "").strip()
@@ -2236,6 +2767,18 @@ def main():
         "--no-response", action="store_true",
         help="Skip DeepSeek response generation (use placeholder text instead)",
     )
+    parser.add_argument(
+        "--train-reranker", action="store_true",
+        help="Train LightGBM reranker from sessions and save to cache",
+    )
+    parser.add_argument(
+        "--reranker-sessions", type=int, default=2000,
+        help="Max sessions to use for reranker training (default: 2000)",
+    )
+    parser.add_argument(
+        "--reranker-pool", type=int, default=100,
+        help="Candidate pool size per turn for reranker training (default: 100)",
+    )
     args = parser.parse_args()
 
     if args.demo:
@@ -2248,6 +2791,19 @@ def main():
         cache_file=args.cache_file,
         deepseek_api_key=DEEPSEEK_API_KEY,
     )
+
+    if args.train_reranker:
+        dfs = load_all_data(args.data_root)
+        if "sessions" not in dfs:
+            print("[ERROR] sessions data not found; cannot train reranker.")
+            return
+        pipeline.train_reranker(
+            dfs["sessions"],
+            max_sessions=args.reranker_sessions,
+            candidate_pool=args.reranker_pool,
+        )
+        print("[train-reranker] Done. Re-run without --train-reranker to use it.")
+        return
 
     if args.query:
         uid = args.user_id or "unknown-user"
